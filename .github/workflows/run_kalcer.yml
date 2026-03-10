@@ -1,0 +1,44 @@
+name: Run Kalcer scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 5 1 * *"
+
+jobs:
+  run-kalcer:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas requests beautifulsoup4 lxml openpyxl
+
+      - name: Run Kalcer scraper
+        env:
+          OUTPUT_DIR: artifacts
+          SCRAPE_SLEEP_MIN: "2.0"
+          SCRAPE_SLEEP_MAX: "5.0"
+          BUFFER_FLUSH: "50"
+          MAX_PAGES: "250"
+          MAX_VARIANTS_PER_PRODUCT: "20"
+          BREAK_EVERY_PRODUCTS: "150"
+          BREAK_SLEEP_MIN: "15"
+          BREAK_SLEEP_MAX: "60"
+        run: |
+          python scrapers/kalcer_scraper.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kalcer-output
+          path: artifacts/
