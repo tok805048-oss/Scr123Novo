@@ -1,11 +1,9 @@
 import json
-import os
 import random
 import re
 from datetime import datetime
-from itertools import product as cart_product
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urljoin, urlparse
+from typing import Dict, List, Tuple
+from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
 
@@ -21,11 +19,7 @@ from common.paths import create_output_paths
 from common.price_utils import (
     convert_price_to_without_vat,
     extract_all_prices,
-    extract_first_price,
     extract_price_per_unit,
-    format_price,
-    parse_float_any,
-    round_price_2dec,
 )
 from common.runtime_utils import batch_pause, startup_sleep
 from common.save_utils import (
@@ -34,592 +28,597 @@ from common.save_utils import (
     save_data_batch_json_only,
     write_excel_from_json,
 )
-from common.schema import build_excel_columns, get_base_record
+from common.schema import (
+    build_excel_columns,
+    get_base_record,
+    merge_extra_columns_from_data,
+)
 from common.text_utils import (
     clean_multiline_text,
     clean_text,
-    extract_art_number,
-    extract_between,
     extract_ean_raw,
     safe_truncate,
     unique_preserve_order,
 )
 from common.unit_utils import guess_em_from_text, normalize_em
 
+
 SHOP_NAME = "Kalcer"
 BASE_URL = "https://www.trgovina-kalcer.si"
 DDV_RATE = 0.22
-
-SLEEP_MIN = float(os.environ.get("SCRAPE_SLEEP_MIN", "2.0"))
-SLEEP_MAX = float(os.environ.get("SCRAPE_SLEEP_MAX", "5.0"))
-BUFFER_FLUSH = int(os.environ.get("BUFFER_FLUSH", "50"))
-MAX_PAGES = int(os.environ.get("MAX_PAGES", "250"))
-MAX_VARIANTS_PER_PRODUCT = int(os.environ.get("MAX_VARIANTS_PER_PRODUCT", "20"))
-BREAK_EVERY_PRODUCTS = int(os.environ.get("BREAK_EVERY_PRODUCTS", "150"))
-BREAK_SLEEP_MIN = float(os.environ.get("BREAK_SLEEP_MIN", "15"))
-BREAK_SLEEP_MAX = float(os.environ.get("BREAK_SLEEP_MAX", "60"))
-ENABLE_CART_PROBE = os.environ.get("KALCER_ENABLE_CART_PROBE", "0").lower() in ("1", "true", "yes", "y")
-
-RUN_UA = os.environ.get("SCRAPE_UA") or random.choice(DEFAULT_USER_AGENTS)
-
-STORE_COLS = ["Zaloga - Ljubljana"]
-EXCEL_COLS = build_excel_columns(STORE_COLS)
-
-_global_item_counter = 0
+BATCH_SIZE = 30
 
 
-# ------------------------------------------------------------
-# URL / category filtering
-# ------------------------------------------------------------
-def is_valid_product_url(url: str) -> bool:
-    if not url:
+def build_page_url(category_url: str, page: int) -> str:
+    sep = "&" if "?" in category_url else "?"
+    return f"{category_url}{sep}page={page}"
+
+
+NON_PRODUCT_PATTERNS = (
+    "/account/",
+    "/checkout/",
+    "/information/",
+    "/download/",
+    "/product/search",
+    "/product/manufacturer",
+    "/blog/",
+    "/image/",
+    "facebook.com",
+    "instagram.com",
+    "mailto:",
+    "javascript:",
+    "#",
+)
+
+
+def is_probable_product_url(url: str) -> bool:
+    if not url or not url.startswith(BASE_URL):
         return False
 
-    if not url.startswith(BASE_URL):
+    lower = url.lower().strip()
+
+    if any(pattern in lower for pattern in NON_PRODUCT_PATTERNS):
         return False
 
-    parsed = urlparse(url)
-    path = parsed.path.rstrip("/").lower()
-
-    blocked_prefixes = (
-        "/account",
-        "/checkout",
-        "/blog",
-        "/information",
-        "/download",
-        "/product/manufacturer",
-        "/product/search",
-        "/index.php",
-    )
-    if path.startswith(blocked_prefixes):
+    path = lower.replace(BASE_URL.lower(), "", 1).strip("/")
+    if not path:
         return False
 
-    blocked_exact = {
-        "",
-        "/",
-        "/gradnja",
-        "/orodja",
-        "/stukature",
-        "/kopalnica-wellness",
-        "/vrata-okna-stopnice",
-        "/leplenje-tesnenje",
+    parts = [p for p in path.split("/") if p]
+    if len(parts) != 1:
+        return False
+
+    blocked_roots = {
+        "gradnja",
+        "stukature",
+        "kopalnica-wellness",
+        "vrata-okna-stopnice",
+        "orodja",
+        "blog",
+        "kontakt",
+        "splosni-pogoji",
+        "vracilo-blaga-kalcer",
+        "dostava-nacini-placila",
+        "o-kalcer",
+        "varovanje-podatkov-zasebnost",
+        "izjava-o-dostopnosti",
     }
-    if path in blocked_exact:
-        return False
 
-    blocked_contains = (
-        "facebook.com",
-        "instagram.com",
-        "linkedin.com",
-        "youtube.com",
-        "mailto:",
-        "tel:",
-    )
-    if any(x in url.lower() for x in blocked_contains):
-        return False
-
-    # produktni URL na Kalcerju nima query parametrov in praviloma ni samo kategorija
-    # precej produktov je 1 nivo pod domeno, kategorije pa pogosto več nivojev
-    if path.count("/") >= 3 and not re.search(r"-\d+(?:-kg|-mm|-cm|-l)?$", path):
-        # to samo po sebi še ni izločitev; pustimo naprej
-        pass
-
-    return True
+    return parts[0] not in blocked_roots
 
 
-def extract_product_urls_from_category_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html, "lxml")
-    urls: List[str] = []
+def extract_product_links_from_category_html(html: str) -> List[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    links: List[str] = []
 
-    # najprej tipični card linki
-    for a in soup.select(".product-layout a[href], .product-grid a[href], .product-thumb a[href], .name a[href]"):
-        href = a.get("href")
-        if not href:
-            continue
-        full = urljoin(BASE_URL, href)
-        if is_valid_product_url(full):
-            urls.append(full)
+    selectors = [
+        ".product-layout .image a",
+        ".product-thumb .image a",
+        ".product-grid .image a",
+        ".product-list .image a",
+        ".caption h4 a",
+        ".name a",
+    ]
 
-    # fallback: lovi URL-je, ki izgledajo kot produkti
-    if not urls:
-        for a in soup.select("a[href]"):
-            href = a.get("href")
+    for selector in selectors:
+        for a_tag in soup.select(selector):
+            href = clean_text(a_tag.get("href"))
             if not href:
                 continue
-            full = urljoin(BASE_URL, href)
-            if is_valid_product_url(full):
-                urls.append(full)
 
-    return unique_preserve_order(urls)
+            full_url = urljoin(BASE_URL, href)
+            if is_probable_product_url(full_url):
+                links.append(full_url)
+
+    return unique_preserve_order(links)
 
 
-def get_product_links_from_category(session, category_url: str, logger) -> List[str]:
-    links: List[str] = []
-    prev_fingerprint: Optional[Tuple[str, ...]] = None
+def get_product_links_from_category(session, user_agent: str, category_url: str, logger) -> List[str]:
+    all_links: List[str] = []
+    seen_first_links: set[str] = set()
+    page = 1
 
-    for page in range(1, MAX_PAGES + 1):
-        page_url = f"{category_url}?page={page}"
+    while True:
+        page_url = build_page_url(category_url, page)
         logger.log(f"  Stran {page}: {page_url}")
 
         html = get_page_content(
             session=session,
             url=page_url,
             base_url=BASE_URL,
-            user_agent=RUN_UA,
+            user_agent=user_agent,
             referer=category_url,
-            sleep_min=SLEEP_MIN,
-            sleep_max=SLEEP_MAX,
+            timeout=25,
+            retries=3,
+            sleep_min=1.1,
+            sleep_max=2.8,
             logger=logger,
         )
+
         if not html:
             break
 
-        page_urls = extract_product_urls_from_category_html(html)
-        if not page_urls:
+        page_links = extract_product_links_from_category_html(html)
+        if not page_links:
             break
 
-        fingerprint = tuple(page_urls[:10])
-        if prev_fingerprint is not None and fingerprint == prev_fingerprint:
-            logger.log(f"  Stran {page} se ponavlja -> zaključujem kategorijo.")
-            break
-        prev_fingerprint = fingerprint
-
-        before = len(links)
-        for u in page_urls:
-            if u not in links:
-                links.append(u)
-
-        # če se nič novega ne doda, verjetno konec
-        if len(links) == before:
+        first_link = page_links[0]
+        if first_link in seen_first_links:
+            logger.log(f"  Stran {page} se ponavlja, zaključujem kategorijo.")
             break
 
-    return links
+        seen_first_links.add(first_link)
+
+        new_count = 0
+        for link in page_links:
+            if link not in all_links:
+                all_links.append(link)
+                new_count += 1
+
+        if new_count == 0:
+            break
+
+        page += 1
+
+    return all_links
 
 
-# ------------------------------------------------------------
-# Product helpers
-# ------------------------------------------------------------
-def extract_image_url(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", attrs={"property": "og:image"})
-    if og and og.get("content"):
-        return clean_text(og["content"])
+def extract_main_image(soup: BeautifulSoup) -> str:
+    og_image = soup.select_one('meta[property="og:image"]')
+    if og_image and og_image.get("content"):
+        return clean_text(og_image.get("content"))
 
-    tw = soup.find("meta", attrs={"name": "twitter:image"})
-    if tw and tw.get("content"):
-        return clean_text(tw["content"])
+    selectors = [
+        ".thumbnails a[href]",
+        ".image-additional a[href]",
+        ".product-info .image a[href]",
+        "a.lightbox-image[href]",
+        ".product-info img[src]",
+        ".thumbnail img[src]",
+    ]
 
-    for img in soup.select("img[src]"):
-        src = img.get("src", "").strip()
-        if not src:
-            continue
-        src_full = urljoin(BASE_URL, src)
-        low = src_full.lower()
-
-        # izloči social / icon / logo slike
-        if any(x in low for x in ("/image/icons/", "/catalog/demo/", "fb-icon", "logo", "instagram", "facebook")):
-            continue
-        return src_full
+    for selector in selectors:
+        node = soup.select_one(selector)
+        if node:
+            href = node.get("href") or node.get("src")
+            if href:
+                return urljoin(BASE_URL, clean_text(href))
 
     return ""
 
 
-def extract_product_long_description(soup: BeautifulSoup) -> str:
-    txt = soup.get_text("\n", strip=True).replace("\xa0", " ")
-    lines = [clean_text(x) for x in txt.splitlines() if clean_text(x)]
+def extract_price_block_text(soup: BeautifulSoup) -> str:
+    selectors = [
+        ".product-price",
+        ".price",
+        ".product-info .price",
+        ".price-box",
+    ]
 
-    # najbolj tipične stop sekcije
-    stop_headers = {
-        "sorodni izdelki",
-        "podobni izdelki",
-        "mnenja",
-        "ocene",
-        "prijava",
-        "košarica",
-        "opis",
-    }
+    parts: List[str] = []
 
-    # če najdemo "Tehnični podatki", vzamemo še to
-    out: List[str] = []
-    capture = False
-    for line in lines:
-        low = line.lower()
+    for selector in selectors:
+        for node in soup.select(selector):
+            text = clean_text(node.get_text(" ", strip=True))
+            if text:
+                parts.append(text)
 
-        if not capture and len(line) > 20:
-            capture = True
+    return " | ".join(unique_preserve_order(parts))
 
-        if capture:
-            if low in stop_headers:
+
+def extract_prices_and_em(
+    soup: BeautifulSoup,
+    title: str,
+    has_variants: bool = False,
+) -> Tuple[str, str, str, str]:
+    price_text = extract_price_block_text(soup)
+
+    price_per_unit, unit = extract_price_per_unit(price_text)
+    unit = normalize_em(unit) if unit else ""
+
+    if has_variants and re.search(r"\bod\s+[\d,.]+\s*€", price_text, flags=re.IGNORECASE):
+        return "", "", "", ""
+
+    all_prices = extract_all_prices(price_text)
+
+    regular_price = ""
+    sale_price = ""
+
+    if price_per_unit:
+        regular_price = price_per_unit
+    elif all_prices:
+        regular_price = all_prices[0]
+
+    if price_per_unit and len(all_prices) >= 2:
+        candidate_regular = all_prices[-1]
+        if candidate_regular and candidate_regular != price_per_unit:
+            sale_price = price_per_unit
+            regular_price = candidate_regular
+
+    if not unit:
+        unit = guess_em_from_text(title)
+
+    return (
+        regular_price,
+        sale_price,
+        convert_price_to_without_vat(regular_price, DDV_RATE),
+        convert_price_to_without_vat(sale_price, DDV_RATE),
+    )
+
+
+def extract_manufacturer_from_soup(soup: BeautifulSoup) -> str:
+    text = soup.get_text("\n", strip=True)
+    match = re.search(r"Proizvajalec\s*:\s*(.+)", text)
+    if not match:
+        return ""
+
+    value = clean_text(match.group(1))
+    value = re.split(r"\b(Šifra|EAN|Izberite|Količina|Opis)\b", value, maxsplit=1)[0].strip()
+    return clean_text(value)
+
+
+def extract_sku_from_soup(soup: BeautifulSoup) -> str:
+    text = soup.get_text("\n", strip=True)
+    match = re.search(r"Šifra\s*:\s*([^\n\r]+)", text)
+    return clean_text(match.group(1)) if match else ""
+
+
+def extract_description_text(soup: BeautifulSoup) -> str:
+    heading = soup.find(["h2", "h3"], string=re.compile(r"^\s*Opis\s*$", flags=re.IGNORECASE))
+
+    if heading:
+        texts: List[str] = []
+        for sibling in heading.find_all_next():
+            if sibling.name in {"h1", "h2", "h3", "h4"} and sibling is not heading:
                 break
-            out.append(line)
 
-    return safe_truncate("\n".join(out), 8000)
+            text = clean_text(sibling.get_text(" ", strip=True))
+            if text:
+                texts.append(text)
 
+        if texts:
+            return safe_truncate(clean_multiline_text("\n".join(unique_preserve_order(texts))))
 
-def extract_brand(soup: BeautifulSoup, page_text: str) -> str:
-    # tipične povezave proizvajalca
-    for a in soup.select('a[href*="/manufacturer"], a[href*="/m-"]'):
-        txt = clean_text(a.get_text(" ", strip=True))
-        if txt and len(txt) <= 80:
-            return txt
+    candidates = []
+    for selector in ["#tab-description", ".tab-content", ".product-info", ".product-description"]:
+        node = soup.select_one(selector)
+        if node:
+            txt = clean_multiline_text(node.get_text("\n", strip=True))
+            if txt:
+                candidates.append(txt)
 
-    m = re.search(r"Proizvajalec\s*[:\-]\s*(.+)", page_text, flags=re.IGNORECASE)
-    if m:
-        return clean_text(m.group(1))
-
-    return ""
-
-
-def extract_delivery_and_stock(page_text: str) -> Tuple[str, str, Dict[str, str]]:
-    text = page_text.lower()
-
-    store_stock: Dict[str, str] = {}
-
-    # Kalcer tipično omenja Ljubljano; prazno ni zaloga
-    if "ljubljana" in text and "na zalogi" in text:
-        store_stock["Ljubljana"] = "DA"
-    elif "ljubljana" in text and "ni na zalogi" in text:
-        store_stock["Ljubljana"] = "NE"
-
-    # dobava
-    delivery = ""
-    if "na zalogi" in text:
-        delivery = "DA"
-    elif "ni na zalogi" in text or "trenutno ni na zalogi" in text:
-        delivery = "NE"
-    else:
-        m = re.search(r"(\d+\s*[-–]\s*\d+\s*delovnih\s*dni)", text, flags=re.IGNORECASE)
-        if m:
-            delivery = clean_text(m.group(1))
-
-    stock_json = json.dumps(store_stock, ensure_ascii=False) if store_stock else ""
-    return delivery, stock_json, store_stock
+    return safe_truncate(max(candidates, key=len)) if candidates else ""
 
 
-def extract_product_id(html: str, soup: BeautifulSoup) -> str:
-    el = soup.select_one('input[name="product_id"]')
-    if el and el.get("value"):
-        return clean_text(el["value"])
+def parse_stock_data(soup: BeautifulSoup):
+    centers: Dict[str, str] = {}
+    page_text = soup.get_text("\n", strip=True)
 
-    m = re.search(r'name="product_id"\s+value="(\d+)"', html)
-    if m:
-        return clean_text(m.group(1))
+    if "Za prikaz zaloge izberite možnosti" in page_text:
+        return "", "", {}
 
-    m = re.search(r"product_id\s*[:=]\s*['\"](\d+)['\"]", html)
-    if m:
-        return clean_text(m.group(1))
+    rows = soup.select(".listing.stockMargin tr")
+    for row in rows:
+        cells = row.select("td")
+        if len(cells) >= 2:
+            center = clean_text(cells[0].get_text(" ", strip=True))
+            value = clean_text(cells[1].get_text(" ", strip=True))
 
-    return ""
+            if center and value and center.lower() not in {"ident", "enota mere"}:
+                centers[center] = value
+
+    if not centers:
+        fallback_matches = re.findall(
+            r"(Ljubljana|Maribor|Novo Mesto|Celje|Koper|Trzin)\s*[:\-]\s*(DA|NE|\d+)",
+            page_text,
+            flags=re.IGNORECASE,
+        )
+        for center, value in fallback_matches:
+            centers[clean_text(center)] = clean_text(value).upper()
+
+    if centers:
+        has_positive = False
+        for value in centers.values():
+            if value.upper() == "DA":
+                has_positive = True
+                break
+
+            number_match = re.search(r"\d+", value)
+            if number_match and int(number_match.group(0)) > 0:
+                has_positive = True
+                break
+
+        delivery = "DA" if has_positive else "NE"
+        return delivery, json.dumps(centers, ensure_ascii=False), centers
+
+    delivery_match = re.search(r"(\d+\s*[-–]\s*\d+\s*delovnih\s*dni)", page_text, flags=re.IGNORECASE)
+    if delivery_match:
+        return clean_text(delivery_match.group(1)), "", {}
+
+    if re.search(r"\bna zalogi\b", page_text, flags=re.IGNORECASE):
+        return "DA", "", {}
+
+    if re.search(r"\bni na zalogi\b", page_text, flags=re.IGNORECASE):
+        return "NE", "", {}
+
+    return "", "", {}
 
 
-def extract_option_groups(soup: BeautifulSoup) -> List[Dict[str, Any]]:
-    groups: List[Dict[str, Any]] = []
+def extract_variant_options(soup: BeautifulSoup) -> List[str]:
+    variants: List[str] = []
 
-    for sel in soup.select('select[name^="option["]'):
-        name = sel.get("name")
+    for select in soup.select("select"):
         label = ""
-        fg = sel.find_parent(class_="form-group")
-        if fg:
-            lab = fg.select_one("label")
-            if lab:
-                label = clean_text(lab.get_text(" ", strip=True))
+        select_id = select.get("id")
 
-        values = []
-        for opt in sel.select("option"):
-            val = clean_text(opt.get("value", ""))
-            txt = clean_text(opt.get_text(" ", strip=True))
-            if val and val != "0":
-                values.append({"id": val, "text": txt})
+        if select_id:
+            label_node = soup.select_one(f'label[for="{select_id}"]')
+            if label_node:
+                label = clean_text(label_node.get_text(" ", strip=True))
 
-        if name and values:
-            groups.append({"name": name, "label": label or name, "values": values})
+        if not label:
+            prev = select.find_previous(["label", "strong", "b", "h4"])
+            if prev:
+                label = clean_text(prev.get_text(" ", strip=True))
 
-    if not groups:
-        radios = soup.select('input[type="radio"][name^="option["]')
-        bucket: Dict[str, Dict[str, Any]] = {}
-        for r in radios:
-            name = r.get("name")
-            val = clean_text(r.get("value", ""))
-            if not name or not val:
+        options = []
+        for option in select.select("option"):
+            value = clean_text(option.get_text(" ", strip=True))
+            if not value or value.lower() in {"izberite", "---", "opcijsko", "please select"}:
                 continue
+            options.append(value)
 
-            label = name
-            txt = ""
-            parent_label = r.find_parent("label")
-            if parent_label:
-                txt = clean_text(parent_label.get_text(" ", strip=True))
+        if label and options:
+            for option in options:
+                variants.append(f"{label}: {option}")
 
-            bucket.setdefault(name, {"name": name, "label": label, "values": []})
-            bucket[name]["values"].append({"id": val, "text": txt or val})
+    if not variants:
+        page_text = soup.get_text("\n", strip=True)
+        match = re.search(r"Izberite:\s*(.+?)\s*Količina", page_text, flags=re.IGNORECASE | re.DOTALL)
+        if match:
+            block = clean_multiline_text(match.group(1))
+            lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if len(lines) >= 2:
+                label = lines[0]
+                for value in lines[1:]:
+                    if value.lower() == label.lower():
+                        continue
+                    variants.append(f"{label}: {value}")
 
-        groups = list(bucket.values())
-
-    return groups
-
-
-def try_price_from_option_text(base_price: str, option_text: str) -> str:
-    base_val = parse_float_any(base_price)
-    if base_val is None:
-        return ""
-
-    m = re.search(r"([+-]\s*\d{1,3}(?:\.\d{3})*,\d{2})\s*€", option_text)
-    if not m:
-        return ""
-
-    mod_val = parse_float_any(m.group(1))
-    if mod_val is None:
-        return ""
-
-    return format_price(base_val + mod_val)
+    return unique_preserve_order(variants)
 
 
-def extract_best_price_and_em(soup: BeautifulSoup, page_text: str) -> Tuple[str, str, str]:
-    """
-    Vrne:
-    - redna cena
-    - akcijska cena
-    - EM
-    """
-    regular = ""
-    special = ""
-    em = ""
+def build_records_for_product(
+    url: str,
+    category_slug: str,
+    today_str: str,
+    soup: BeautifulSoup,
+    next_zap_start: int,
+):
+    title_node = soup.select_one("h1")
+    title = clean_text(title_node.get_text(" ", strip=True)) if title_node else ""
+    if not title:
+        return [], next_zap_start
 
-    # najprej lovi cene na enoto
-    for candidate in [
-        page_text,
-        soup.get_text(" ", strip=True),
-    ]:
-        price_per_em, unit = extract_price_per_unit(candidate)
-        if price_per_em:
-            regular = round_price_2dec(price_per_em)
-            em = normalize_em(unit)
-            break
+    sku = extract_sku_from_soup(soup)
+    manufacturer = extract_manufacturer_from_soup(soup)
+    ean = extract_ean_raw(soup.get_text("\n", strip=True))
+    description = extract_description_text(soup)
+    image_url = extract_main_image(soup)
 
-    # fallback na vse cene
-    prices = extract_all_prices(page_text)
-    if not regular and prices:
-        regular = prices[0]
+    dobava, stock_json, centers = parse_stock_data(soup)
 
-    # OpenCart-like selektorji
-    special_el = soup.select_one(".price-new, .productSpecialPrice")
-    old_el = soup.select_one(".price-old, .price-old, .old-price")
+    variants = extract_variant_options(soup)
+    has_variants = bool(variants)
 
-    if special_el:
-        sp = extract_first_price(special_el.get_text(" ", strip=True))
-        if sp:
-            special = sp
+    price_w_vat, sale_w_vat, price_wo_vat, sale_wo_vat = extract_prices_and_em(
+        soup,
+        title,
+        has_variants=has_variants,
+    )
 
-    if old_el:
-        rg = extract_first_price(old_el.get_text(" ", strip=True))
-        if rg:
-            regular = rg
+    em = guess_em_from_text(title + "\n" + description)
+    if price_w_vat:
+        _, unit_from_block = extract_price_per_unit(extract_price_block_text(soup))
+        if unit_from_block:
+            em = normalize_em(unit_from_block)
 
-    # če je akcijska cena, a regular manjka, regular pusti prazen
-    if not em:
-        em = normalize_em(guess_em_from_text(page_text))
+    base_row = get_base_record()
+    base_row.update(
+        {
+            "Skupina": category_slug,
+            "Opis": title,
+            "Opis izdelka": description,
+            "Oznaka / naziv": sku,
+            "EAN": ean,
+            "EM": normalize_em(em),
+            "Proizvajalec": manufacturer,
+            "Veljavnost od": today_str,
+            "Dobava": dobava,
+            "Zaloga po centrih": stock_json,
+            "Cena / EM (z DDV)": price_w_vat,
+            "Akcijska cena / EM (z DDV)": sale_w_vat,
+            "Cena / EM (brez DDV)": price_wo_vat,
+            "Akcijska cena / EM (brez DDV)": sale_wo_vat,
+            "URL": url,
+            "SLIKA URL": image_url,
+        }
+    )
 
-    return regular, special, em
+    for center_name, value in centers.items():
+        base_row[f"Zaloga - {center_name}"] = value
+
+    records: List[Dict[str, str]] = []
+
+    if variants:
+        for variant in variants:
+            row = dict(base_row)
+            row["Varianta"] = variant
+            row["Zap"] = next_zap_start
+
+            if not price_w_vat and not sale_w_vat:
+                row["Cena / EM (z DDV)"] = ""
+                row["Akcijska cena / EM (z DDV)"] = ""
+                row["Cena / EM (brez DDV)"] = ""
+                row["Akcijska cena / EM (brez DDV)"] = ""
+
+            records.append(row)
+            next_zap_start += 1
+    else:
+        row = dict(base_row)
+        row["Zap"] = next_zap_start
+        records.append(row)
+        next_zap_start += 1
+
+    return records, next_zap_start
 
 
-def build_product_record(url: str, cat_name: str, date_str: str) -> Dict[str, Any]:
-    data = get_base_record()
-    data["Skupina"] = cat_name
-    data["URL"] = url
-    data["Veljavnost od"] = date_str
-    return data
-
-
-def extract_product_details(session, url: str, cat_name: str, date_str: str, logger) -> List[Dict[str, Any]]:
-    global _global_item_counter
-
+def get_product_details(
+    session,
+    user_agent: str,
+    url: str,
+    category_slug: str,
+    today_str: str,
+    next_zap_start: int,
+    logger,
+):
     logger.log(f"    - Detajli: {url}")
 
     html = get_page_content(
         session=session,
         url=url,
         base_url=BASE_URL,
-        user_agent=RUN_UA,
-        referer=url,
-        sleep_min=SLEEP_MIN,
-        sleep_max=SLEEP_MAX,
+        user_agent=user_agent,
+        referer=BASE_URL,
+        timeout=25,
+        retries=3,
+        sleep_min=1.2,
+        sleep_max=2.9,
         logger=logger,
     )
+
     if not html:
-        return []
+        return [], next_zap_start
 
-    soup = BeautifulSoup(html, "lxml")
-    page_text = soup.get_text("\n", strip=True).replace("\xa0", " ")
-
-    title = ""
-    h1 = soup.select_one("h1.product-name") or soup.select_one("h1")
-    if h1:
-        title = clean_text(h1.get_text(" ", strip=True))
-
-    # minimalna validacija: ne sprejmi sistemskih strani
-    if not title or title.lower() in {"prijava", "košarica", "blog", "splošni pogoji"}:
-        return []
-
-    data = build_product_record(url, cat_name, date_str)
-    data["Opis"] = title
-    data["Opis izdelka"] = extract_product_long_description(soup)
-    data["EAN"] = extract_ean_raw(page_text)
-    data["Oznaka / naziv"] = extract_art_number(page_text)
-    data["Proizvajalec"] = extract_brand(soup, page_text)
-    data["SLIKA URL"] = extract_image_url(soup)
-
-    regular, special, em = extract_best_price_and_em(soup, page_text)
-    data["Cena / EM (z DDV)"] = regular
-    data["Akcijska cena / EM (z DDV)"] = special
-    data["EM"] = normalize_em(em or guess_em_from_text(title))
-
-    if data["Cena / EM (z DDV)"]:
-        data["Cena / EM (brez DDV)"] = convert_price_to_without_vat(data["Cena / EM (z DDV)"], DDV_RATE)
-    if data["Akcijska cena / EM (z DDV)"]:
-        data["Akcijska cena / EM (brez DDV)"] = convert_price_to_without_vat(
-            data["Akcijska cena / EM (z DDV)"], DDV_RATE
-        )
-
-    delivery, stock_json, stock_map = extract_delivery_and_stock(page_text)
-    data["Dobava"] = delivery
-    data["Zaloga po centrih"] = stock_json
-    data["Zaloga - Ljubljana"] = stock_map.get("Ljubljana", "")
-
-    # variante
-    option_groups = extract_option_groups(soup)
-    if not option_groups:
-        _global_item_counter += 1
-        data["Zap"] = _global_item_counter
-        return [data]
-
-    combos = 1
-    for g in option_groups:
-        combos *= len(g["values"])
-    if combos > MAX_VARIANTS_PER_PRODUCT:
-        _global_item_counter += 1
-        data["Zap"] = _global_item_counter
-        return [data]
-
-    product_id = extract_product_id(html, soup)
-    results: List[Dict[str, Any]] = []
-
-    value_lists = [
-        [(g["name"], v["id"], g["label"], v["text"]) for v in g["values"]]
-        for g in option_groups
-    ]
-
-    for combo in cart_product(*value_lists):
-        rec = dict(data)
-        variant_label = ", ".join(
-            [f"{lab}: {txt}".strip(": ") for (_, _, lab, txt) in combo if clean_text(txt)]
-        )
-        rec["Varianta"] = variant_label
-
-        variant_price = ""
-        for (_, _, _, txt) in combo:
-            variant_price = try_price_from_option_text(rec["Cena / EM (z DDV)"], txt)
-            if variant_price:
-                break
-
-        if variant_price:
-            rec["Cena / EM (z DDV)"] = variant_price
-            rec["Cena / EM (brez DDV)"] = convert_price_to_without_vat(variant_price, DDV_RATE)
-
-        _global_item_counter += 1
-        rec["Zap"] = _global_item_counter
-        results.append(rec)
-
-    return results
+    soup = BeautifulSoup(html, "html.parser")
+    return build_records_for_product(url, category_slug, today_str, soup, next_zap_start)
 
 
-# ------------------------------------------------------------
-# Main
-# ------------------------------------------------------------
-def main() -> None:
-    global _global_item_counter
-
+def scrape_kalcer() -> Tuple[str, str, str]:
     startup_sleep()
 
     json_path, excel_path, log_path, _ = create_output_paths(SHOP_NAME)
     logger = open_logger(log_path)
 
-    logger.log(f"--- Zagon {SHOP_NAME} ---")
-    logger.log(f"UA: {RUN_UA}")
-    logger.log(f"JSON:  {json_path}")
-    logger.log(f"Excel: {excel_path}")
-    logger.log(f"Log:   {log_path}")
-
-    session = build_session()
-    warmup_session(session, BASE_URL, RUN_UA)
-
-    existing = load_existing_data(json_path, excel_path)
-    _global_item_counter = get_max_zap(existing)
-
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    buffer: List[Dict[str, Any]] = []
-    processed = 0
-
     try:
-        for main_cat, urls in KALCER_CATEGORIES.items():
-            logger.log(f"\n--- {main_cat} ---")
-            for category_url in urls:
-                sub_name = category_url.rstrip("/").split("/")[-1]
-                logger.log(f"\n  Kategorija: {sub_name}")
+        logger.log(f"--- Zagon {SHOP_NAME} ---")
+        logger.log(f"JSON:  {json_path}")
+        logger.log(f"Excel: {excel_path}")
+        logger.log(f"Log:   {log_path}")
 
-                product_links = get_product_links_from_category(session, category_url, logger)
+        existing_data = load_existing_data(json_path, excel_path)
+        next_zap = get_max_zap(existing_data) + 1
+        today_str = datetime.now().strftime("%Y-%m-%d")
 
-                for link in product_links:
-                    rows = extract_product_details(session, link, sub_name, date_str, logger)
+        session = build_session()
+        user_agent = random.choice(DEFAULT_USER_AGENTS)
+        warmup_session(session, BASE_URL, user_agent)
+
+        batch_rows: List[Dict[str, str]] = []
+        processed_products = 0
+
+        for group_name, category_urls in KALCER_CATEGORIES.items():
+            logger.log("")
+            logger.log(f"--- {group_name} ---")
+
+            for category_url in category_urls:
+                category_slug = category_url.rstrip("/").split("/")[-1]
+                logger.log("")
+                logger.log(f"  Kategorija: {category_slug}")
+
+                product_links = get_product_links_from_category(
+                    session,
+                    user_agent,
+                    category_url,
+                    logger,
+                )
+
+                if not product_links:
+                    logger.log("  Ni najdenih produktnih linkov.")
+                    continue
+
+                for product_url in product_links:
+                    rows, next_zap = get_product_details(
+                        session,
+                        user_agent,
+                        product_url,
+                        category_slug,
+                        today_str,
+                        next_zap,
+                        logger,
+                    )
+
                     if rows:
-                        buffer.extend(rows)
-                        processed += len(rows)
+                        batch_rows.extend(rows)
+                        processed_products += 1
 
-                    if len(buffer) >= BUFFER_FLUSH:
+                    if len(batch_rows) >= BATCH_SIZE:
                         save_data_batch_json_only(
-                            new_data=buffer,
+                            new_data=batch_rows,
                             json_path=json_path,
                             excel_path=excel_path,
                             logger=logger,
                             use_variant=True,
                         )
-                        buffer = []
+                        batch_rows = []
 
                     batch_pause(
-                        processed_count=processed,
-                        every_n=BREAK_EVERY_PRODUCTS,
-                        pause_min=BREAK_SLEEP_MIN,
-                        pause_max=BREAK_SLEEP_MAX,
+                        processed_count=processed_products,
+                        every_n=40,
+                        pause_min=8.0,
+                        pause_max=18.0,
                         logger=logger,
                     )
 
-                if buffer:
-                    save_data_batch_json_only(
-                        new_data=buffer,
-                        json_path=json_path,
-                        excel_path=excel_path,
-                        logger=logger,
-                        use_variant=True,
-                    )
-                    buffer = []
-
-    except Exception as e:
-        logger.log(f"NAPAKA: {e}")
-    finally:
-        if buffer:
+        if batch_rows:
             save_data_batch_json_only(
-                new_data=buffer,
+                new_data=batch_rows,
                 json_path=json_path,
                 excel_path=excel_path,
                 logger=logger,
                 use_variant=True,
             )
 
-        write_excel_from_json(
-            json_path=json_path,
-            excel_path=excel_path,
-            columns=EXCEL_COLS,
-            logger=logger,
-        )
+        final_data = load_existing_data(json_path, excel_path)
+        columns = build_excel_columns(merge_extra_columns_from_data(final_data))
+        write_excel_from_json(json_path, excel_path, columns, logger=logger)
+
+        logger.log(f"Konec. Skupno zapisov: {len(final_data)}")
+        return json_path, excel_path, log_path
+
+    finally:
         logger.close()
 
 
 if __name__ == "__main__":
-    main()
+    scrape_kalcer()
