@@ -35,7 +35,7 @@ jobs:
           BREAK_SLEEP_MIN: "15"
           BREAK_SLEEP_MAX: "60"
         run: |
-          python scrapers/kalcer_scraper.py
+          python -m scrapers.kalcer_scraper
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
