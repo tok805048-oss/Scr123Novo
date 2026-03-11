@@ -1,0 +1,47 @@
+name: Run Slovenijales Scraper
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 5 * * 4"
+
+jobs:
+  run-slovenijales:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    env:
+      PYTHONUNBUFFERED: "1"
+      OUTPUT_DIR: artifacts
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install requests beautifulsoup4 pandas openpyxl lxml
+          fi
+
+      - name: Create artifacts directory
+        run: mkdir -p artifacts
+
+      - name: Run Slovenijales scraper
+        run: python -m scrapers.slovenijales_scraper
+
+      - name: Upload scraper outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slovenijales-scraper-output
+          path: artifacts/
+          if-no-files-found: warn
