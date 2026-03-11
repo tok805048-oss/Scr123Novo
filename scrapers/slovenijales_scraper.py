@@ -202,7 +202,8 @@ def extract_sku(soup: BeautifulSoup) -> str:
 def extract_image_url(soup: BeautifulSoup) -> str:
     og = soup.find("meta", attrs={"property": "og:image"})
     if og and og.get("content"):
-        return clean_text(og.get("content"))
+        content = clean_text(og.get("content"))
+        return content if content.startswith("http") else urljoin(BASE_URL, content)
 
     img = (
         soup.select_one(".flexslider .slides img[src]")
@@ -210,7 +211,8 @@ def extract_image_url(soup: BeautifulSoup) -> str:
         or soup.select_one("img[src]")
     )
     if img and img.get("src"):
-        return urljoin(BASE_URL, clean_text(img.get("src")))
+        src = clean_text(img.get("src"))
+        return src if src.startswith("http") else urljoin(BASE_URL, src)
 
     return ""
 
@@ -261,34 +263,78 @@ def extract_manufacturer(soup: BeautifulSoup) -> str:
     return ""
 
 
-def extract_prices_and_em(soup: BeautifulSoup, title: str, description: str) -> Tuple[str, str, str, str, str]:
-    text = clean_text(soup.get_text(" ", strip=True).replace("\xa0", " "))
+def _extract_product_price_block_text(soup: BeautifulSoup) -> str:
+    """
+    Ceno beri samo iz glavnega produktnega price bloka.
+    To prepreči napačno pobiranje dimenzij tipa 2200 x 1000 x 40 mm kot cene.
+    """
+    candidates: List[str] = []
 
-    price_per_unit, unit = extract_price_per_unit(text)
-    all_prices = extract_all_prices(text)
+    selectors = [
+        ".product-single .price",
+        ".product-single",
+        ".product-info",
+        '[itemprop="offers"]',
+        ".summary",
+    ]
+
+    for selector in selectors:
+        for node in soup.select(selector):
+            txt = clean_text(node.get_text(" ", strip=True))
+            if not txt:
+                continue
+            # pomembno: vzamemo samo bloke, kjer je znak €
+            if "€" in txt:
+                candidates.append(txt)
+
+    if candidates:
+        # izberi najkrajši smiseln blok s ceno, da ne vleče celega produkta
+        candidates = sorted(candidates, key=len)
+        return candidates[0]
+
+    return ""
+
+
+def extract_prices_and_em(soup: BeautifulSoup, title: str, description: str) -> Tuple[str, str, str, str, str]:
+    text = _extract_product_price_block_text(soup)
 
     regular_price = ""
     sale_price = ""
+    unit = ""
 
+    # najprej poskusi ceno na EM
+    price_per_unit, unit = extract_price_per_unit(text)
     if price_per_unit:
-        regular_price = price_per_unit
+        regular_price = round_price_2dec(price_per_unit)
         unit = normalize_em(unit)
-    elif all_prices:
-        regular_price = all_prices[0]
-    else:
+
+    # če ni cene na EM, poberi glavno ceno iz price bloka
+    all_prices = extract_all_prices(text)
+    if not regular_price and all_prices:
+        regular_price = round_price_2dec(all_prices[0])
+
+    # če sta v glavnem bloku dve ceni, prva je praviloma akcijska/trenutna,
+    # druga pa prejšnja cena
+    if len(all_prices) >= 2:
+        first = round_price_2dec(all_prices[0])
+        second = round_price_2dec(all_prices[1])
+
+        if first and second and first != second:
+            regular_price = first
+            sale_price = second
+
+    if not regular_price:
         fp = extract_first_price(text)
         if fp:
-            regular_price = fp
+            regular_price = round_price_2dec(fp)
 
     if not unit:
         guessed = normalize_em(guess_em_from_text(title))
         unit = guessed if guessed else "kos"
 
-    # Slovenijales pogosto pokaže: 44,10 € ... oz. 4,90 € / m2
-    # Tu mora zmagati cena na EM, če obstaja.
     return (
-        round_price_2dec(regular_price) if regular_price else "",
-        round_price_2dec(sale_price) if sale_price else "",
+        regular_price,
+        sale_price,
         convert_price_to_without_vat(regular_price, DDV_RATE) if regular_price else "",
         convert_price_to_without_vat(sale_price, DDV_RATE) if sale_price else "",
         unit or "kos",
