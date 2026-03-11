@@ -233,14 +233,76 @@ def extract_manufacturer(soup: BeautifulSoup) -> str:
     return ""
 
 
-def extract_stock_data(soup: BeautifulSoup) -> Tuple[str, str, Dict[str, str]]:
-    centers: Dict[str, str] = {}
-    text = soup.get_text("\n", strip=True).replace("\xa0", " ")
+def _extract_stock_section_lines(text: str) -> List[str]:
+    lines = [clean_text(x) for x in text.replace("\xa0", " ").splitlines()]
+    lines = [x for x in lines if x]
 
-    # Best-effort po centrih / prevzemnih mestih
-    matches = re.findall(r"(Merkur[^\n\r]+?)\s+(\d+)\s+kos", text, flags=re.IGNORECASE)
+    start_idx = None
+    end_idx = None
+
+    for i, line in enumerate(lines):
+        if line.lower() == "zaloga v trgovskih centrih":
+            start_idx = i + 1
+            break
+
+    if start_idx is None:
+        return []
+
+    for j in range(start_idx, len(lines)):
+        low = lines[j].lower()
+        if low.startswith("brezplačna pomoč pri nakupu") or low.startswith("izračun mesečnega obroka") or low.startswith("povpraševanje"):
+            end_idx = j
+            break
+
+    if end_idx is None:
+        end_idx = len(lines)
+
+    return lines[start_idx:end_idx]
+
+
+def _parse_store_lines_to_centers(lines: List[str]) -> Dict[str, str]:
+    centers: Dict[str, str] = {}
+    pending_status: Optional[str] = None
+
+    for line in lines:
+        low = line.lower().strip()
+
+        if low in {"na zalogi", "ni zaloge", "zadnji kosi"}:
+            pending_status = line
+            continue
+
+        if low.startswith("merkur "):
+            center_name = re.sub(r"\(\+386.*$", "", line).strip()
+            center_name = clean_text(center_name)
+            if center_name:
+                if pending_status:
+                    centers[center_name] = pending_status
+                    pending_status = None
+                elif center_name not in centers:
+                    centers[center_name] = ""
+
+    return centers
+
+
+def extract_stock_data(soup: BeautifulSoup) -> Tuple[str, str, Dict[str, str]]:
+    text = soup.get_text("\n", strip=True).replace("\xa0", " ")
+    centers: Dict[str, str] = {}
+
+    # 1) najprej preberi blok "Zaloga v trgovskih centrih"
+    section_lines = _extract_stock_section_lines(text)
+    if section_lines:
+        centers = _parse_store_lines_to_centers(section_lines)
+
+    if centers:
+        positive_values = {"na zalogi", "zadnji kosi"}
+        has_positive = any((v or "").lower() in positive_values for v in centers.values())
+        dobava = "DA" if has_positive else "NE"
+        return dobava, json.dumps(centers, ensure_ascii=False), centers
+
+    # 2) fallback: stari numerični vzorec
+    matches = re.findall(r"(MERKUR[^\n\r]+?)\s+(\d+)\s+kos", text, flags=re.IGNORECASE)
     for name, qty in matches:
-        center_name = clean_text(name)
+        center_name = clean_text(re.sub(r"\(\+386.*$", "", name).strip())
         qty_text = clean_text(qty)
         if center_name and qty_text:
             centers[center_name] = qty_text
@@ -250,8 +312,9 @@ def extract_stock_data(soup: BeautifulSoup) -> Tuple[str, str, Dict[str, str]]:
         dobava = "DA" if has_positive else "NE"
         return dobava, json.dumps(centers, ensure_ascii=False), centers
 
+    # 3) fallback: splošni status na vrhu produkta
     lower = text.lower()
-    if "ni na zalogi" in lower:
+    if "ni na zalogi" in lower or "ni zaloge" in lower:
         return "NE", "", {}
     if "na zalogi" in lower:
         return "DA", "", {}
@@ -297,18 +360,13 @@ def extract_prices_and_em(soup: BeautifulSoup, title: str, description: str) -> 
         regular_price = extract_first_price(text)
         unit = ""
 
-    # Merkur: če eksplicitno kaže ceno na EM, to uporabimo.
-    # Če kaže samo glavno ceno, pustimo kos.
     if not unit:
         guessed = normalize_em(guess_em_from_text(title))
         unit = guessed if guessed else "kos"
 
-    # Če je eksplicitno "/ paket", to še ne pomeni, da je prava EM paket;
-    # raje ostani pri ceni na enoto, če obstaja.
     if unit == "kos":
         title_lower = f"{title} {description}".lower()
         if re.search(r"\b(m2|m²)\b", title_lower):
-            # samo če je v price bloku res vidna cena na m2
             if re.search(r"€\s*/\s*(m2|m²)", text, flags=re.IGNORECASE):
                 unit = "m2"
 
