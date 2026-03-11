@@ -242,25 +242,9 @@ def extract_prices_and_em(soup: BeautifulSoup, title: str) -> Tuple[str, str, st
     elif all_prices:
         regular_price = all_prices[0]
 
-    # Kalcer pogosto kaže:
-    # od 39,44€ (4,21€/M2)
-    # Brez DDV: 32,33€
-    # Redna cena (z DDV): 81,32€
-    #
-    # V takem primeru želimo:
-    # Cena / EM = 4,21
-    # Akcijska cena prazno
-    #
-    # Če ni cene na EM, pa vzamemo glavno ceno.
-    #
-    # Ne poskušamo na silo mapirati "Redna cena (z DDV)" v akcijsko ceno na EM.
-
     if not unit:
         title_em = normalize_em(guess_em_from_text(title))
         unit = title_em if title_em else "kos"
-
-    if not regular_price:
-        regular_price = ""
 
     return (
         regular_price,
@@ -289,7 +273,6 @@ def extract_sku_from_soup(soup: BeautifulSoup) -> str:
 
 
 def extract_description_text(soup: BeautifulSoup) -> str:
-    # Prioriteta: vsebina zavihka Opis
     possible_nodes = []
 
     for selector in [
@@ -311,7 +294,6 @@ def extract_description_text(soup: BeautifulSoup) -> str:
         cleaned = re.sub(r"\bKoličina\b.*", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
         return safe_truncate(cleaned.strip())
 
-    # Fallback: poišči sekcijo po headingu "Opis"
     heading = soup.find(["h2", "h3"], string=re.compile(r"^\s*Opis\s*$", flags=re.IGNORECASE))
     if heading:
         texts: List[str] = []
@@ -336,9 +318,8 @@ def parse_stock_data(soup: BeautifulSoup):
     centers: Dict[str, str] = {}
     page_text = soup.get_text("\n", strip=True)
 
-    if "Za prikaz zaloge izberite možnosti" in page_text:
-        return "", "", {}
-
+    # Najprej vedno poskusi prebrati tabelo zaloge po centrih, četudi stran kaže,
+    # da je treba izbrati možnosti. Pri nekaterih produktih je tabela vseeno v HTML.
     rows = soup.select(".listing.stockMargin tr")
     for row in rows:
         cells = row.select("td")
@@ -373,6 +354,10 @@ def parse_stock_data(soup: BeautifulSoup):
         delivery = "DA" if has_positive else "NE"
         return delivery, json.dumps(centers, ensure_ascii=False), centers
 
+    # Če ni mogoče zanesljivo prebrati zaloge brez izbire variante, je ne ugibamo.
+    if "Za prikaz zaloge izberite možnosti" in page_text:
+        return "", "", {}
+
     delivery_match = re.search(r"(\d+\s*[-–]\s*\d+\s*delovnih\s*dni)", page_text, flags=re.IGNORECASE)
     if delivery_match:
         return clean_text(delivery_match.group(1)), "", {}
@@ -389,7 +374,22 @@ def parse_stock_data(soup: BeautifulSoup):
 def extract_variant_options(soup: BeautifulSoup) -> List[str]:
     variants: List[str] = []
 
+    # Osredotoči se na produktni blok "Izberite", ne na vse selecte na strani.
+    page_text = soup.get_text("\n", strip=True)
+
+    select_candidates = []
     for select in soup.select("select"):
+        surrounding = ""
+        parent = select.parent
+        if parent:
+            surrounding = clean_text(parent.get_text(" ", strip=True))
+        if "izberite" in page_text.lower() or "izberite" in surrounding.lower():
+            select_candidates.append(select)
+
+    if not select_candidates:
+        select_candidates = soup.select("select")
+
+    for select in select_candidates:
         label = ""
         select_id = select.get("id")
 
@@ -399,14 +399,29 @@ def extract_variant_options(soup: BeautifulSoup) -> List[str]:
                 label = clean_text(label_node.get_text(" ", strip=True))
 
         if not label:
-            prev = select.find_previous(["label", "strong", "b", "h4"])
+            prev = select.find_previous(["label", "strong", "b", "h4", "h3"])
             if prev:
                 label = clean_text(prev.get_text(" ", strip=True))
+
+        if not label:
+            continue
+
+        if label.lower() in {"količina", "kolicina", "qty", "quantity"}:
+            continue
 
         options = []
         for option in select.select("option"):
             value = clean_text(option.get_text(" ", strip=True))
-            if not value or value.lower() in {"izberite", "---", "opcijsko", "please select"}:
+            if not value:
+                continue
+            if value.lower() in {
+                "izberite",
+                "---",
+                "opcijsko",
+                "please select",
+                "količina",
+                "kolicina",
+            }:
                 continue
             options.append(value)
 
@@ -415,17 +430,19 @@ def extract_variant_options(soup: BeautifulSoup) -> List[str]:
                 variants.append(f"{label}: {option}")
 
     if not variants:
-        page_text = soup.get_text("\n", strip=True)
         match = re.search(r"Izberite:\s*(.+?)\s*Količina", page_text, flags=re.IGNORECASE | re.DOTALL)
         if match:
             block = clean_multiline_text(match.group(1))
             lines = [line.strip() for line in block.splitlines() if line.strip()]
             if len(lines) >= 2:
                 label = lines[0]
-                for value in lines[1:]:
-                    if value.lower() == label.lower():
-                        continue
-                    variants.append(f"{label}: {value}")
+                if label.lower() not in {"količina", "kolicina"}:
+                    for value in lines[1:]:
+                        if value.lower() == label.lower():
+                            continue
+                        if value.lower() in {"količina", "kolicina"}:
+                            continue
+                        variants.append(f"{label}: {value}")
 
     return unique_preserve_order(variants)
 
