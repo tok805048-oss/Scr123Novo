@@ -36,7 +36,7 @@ jobs:
         run: mkdir -p artifacts
 
       - name: Run Merkur scraper
-        run: python scrapers/merkur_scraper.py
+        run: python -m scrapers.merkur_scraper
 
       - name: Upload scraper outputs
         if: always()
