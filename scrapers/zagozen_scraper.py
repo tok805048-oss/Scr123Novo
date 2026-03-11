@@ -2,7 +2,7 @@ import random
 import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -47,17 +47,62 @@ BATCH_SIZE = 30
 MAX_PAGES = 250
 
 
-def add_or_replace_query(url: str, params: Dict[str, str]) -> str:
-    parts = urlparse(url)
-    q = dict(parse_qsl(parts.query))
-    q.update(params)
-    new_query = urlencode(q)
-    return urlunparse((parts.scheme, parts.netloc, parts.path, parts.params, new_query, parts.fragment))
+def build_page_urls(category_url: str, page: int) -> List[str]:
+    """
+    Zagožen se bolje obnaša z WooCommerce-style /page/2/ URL-ji.
+    Kot fallback dodamo še ?paged=.
+    """
+    urls: List[str] = []
+
+    if page == 1:
+        urls.append(category_url.rstrip("/"))
+    else:
+        urls.append(category_url.rstrip("/") + f"/page/{page}/")
+        if "?" in category_url:
+            urls.append(category_url + f"&paged={page}")
+        else:
+            urls.append(category_url.rstrip("/") + f"?paged={page}")
+
+    return urls
 
 
-def build_page_url(category_url: str, page: int) -> str:
-    # Zagožen kaže paginacijo kot ?page=
-    return add_or_replace_query(category_url, {"page": str(page)})
+def _is_product_url(url: str) -> bool:
+    if not url:
+        return False
+    if not url.startswith(BASE_URL):
+        return False
+
+    low = url.lower()
+    blocked = (
+        "/tag/",
+        "/author/",
+        "/category/",
+        "/produkt-kategorija/",
+        "/cart/",
+        "/checkout/",
+        "/my-account/",
+        "mailto:",
+        "javascript:",
+        "#",
+    )
+    if any(x in low for x in blocked):
+        return False
+
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return False
+
+    # produktni URL-ji so praviloma konkretni slugi, ne vrhnje kategorije
+    top_level = {
+        "vodovod",
+        "kanalizacija",
+        "energetika",
+        "aktualno",
+    }
+    if path in top_level:
+        return False
+
+    return True
 
 
 def extract_product_links_from_category_html(html: str) -> List[str]:
@@ -65,10 +110,15 @@ def extract_product_links_from_category_html(html: str) -> List[str]:
     links: List[str] = []
 
     selectors = [
+        # stari delujoči woo selektorji
         "li.product a[href]",
-        ".products li a[href]",
-        ".product a[href]",
         "a.woocommerce-LoopProduct-link[href]",
+        # dejanska struktura Zagožen kategorij
+        ".product-grid a[href]",
+        ".products a[href]",
+        "article a[href]",
+        # fallback: vsi linki v glavnem vsebinskem delu
+        "main a[href]",
     ]
 
     for selector in selectors:
@@ -77,39 +127,45 @@ def extract_product_links_from_category_html(html: str) -> List[str]:
             if not href:
                 continue
 
-            full_url = urljoin(BASE_URL, href)
-            if not full_url.startswith(BASE_URL):
+            full_url = href if href.startswith("http") else urljoin(BASE_URL, href)
+            if not _is_product_url(full_url):
                 continue
 
-            low = full_url.lower()
-            if "/product-category/" in low or "/kategorija" in low:
-                continue
-
-            links.append(full_url)
+            text = clean_text(a_tag.get_text(" ", strip=True))
+            # bonus filter: tipični produktni linki imajo vsaj nekaj vsebine ali slug
+            if text or len(urlparse(full_url).path.strip("/").split("/")[-1]) > 6:
+                links.append(full_url)
 
     return list(dict.fromkeys(links))
 
 
 def get_product_links_from_category(session, user_agent: str, category_url: str, logger) -> List[str]:
     all_links: List[str] = []
-    seen_first: set[str] = set()
+    last_first: Optional[str] = None
 
     for page in range(1, MAX_PAGES + 1):
-        page_url = build_page_url(category_url, page)
-        logger.log(f"  Stran {page}: {page_url}")
+        candidate_urls = build_page_urls(category_url, page)
+        html = None
+        used_url = candidate_urls[0]
 
-        html = get_page_content(
-            session=session,
-            url=page_url,
-            base_url=BASE_URL,
-            user_agent=user_agent,
-            referer=category_url,
-            timeout=25,
-            retries=3,
-            sleep_min=1.0,
-            sleep_max=2.8,
-            logger=logger,
-        )
+        for candidate in candidate_urls:
+            logger.log(f"  Stran {page}: {candidate}")
+            html = get_page_content(
+                session=session,
+                url=candidate,
+                base_url=BASE_URL,
+                user_agent=user_agent,
+                referer=category_url,
+                timeout=25,
+                retries=3,
+                sleep_min=1.0,
+                sleep_max=2.8,
+                logger=logger,
+            )
+            if html:
+                used_url = candidate
+                break
+
         if not html:
             break
 
@@ -117,11 +173,11 @@ def get_product_links_from_category(session, user_agent: str, category_url: str,
         if not page_links:
             break
 
-        first_url = page_links[0]
-        if first_url in seen_first:
+        first_href = page_links[0]
+        if page > 1 and last_first and first_href == last_first:
             logger.log("  Stran se ponavlja. Konec kategorije.")
             break
-        seen_first.add(first_url)
+        last_first = first_href
 
         new_count = 0
         for link in page_links:
@@ -133,11 +189,13 @@ def get_product_links_from_category(session, user_agent: str, category_url: str,
             break
 
         soup = BeautifulSoup(html, "html.parser")
-        if not soup.select_one(".pagination, .woocommerce-pagination, a.next, a.next.page-numbers"):
-            if page >= 2:
-                break
 
-    return all_links
+        # če ni vidne pagination navigacije, po 1. strani vseeno še ne zaključimo,
+        # ker imajo nekatere kategorije samo eno stran
+        if page >= 2 and not soup.select_one(".pagination, nav.woocommerce-pagination, a.next, a.next.page-numbers"):
+            break
+
+    return list(dict.fromkeys(all_links))
 
 
 def extract_title(soup: BeautifulSoup) -> str:
@@ -154,7 +212,9 @@ def extract_sku(soup: BeautifulSoup, product_url: str) -> str:
 
     sku_node = soup.select_one(".sku")
     if sku_node and sku_node.get_text(strip=True):
-        return clean_text(sku_node.get_text(" ", strip=True))
+        sku_text = clean_text(sku_node.get_text(" ", strip=True))
+        if sku_text.lower() != "n/a":
+            return sku_text
 
     slug = urlparse(product_url).path.strip("/").split("/")[-1]
     return clean_text(slug)[:120]
@@ -163,7 +223,8 @@ def extract_sku(soup: BeautifulSoup, product_url: str) -> str:
 def extract_image_url(soup: BeautifulSoup) -> str:
     og = soup.find("meta", attrs={"property": "og:image"})
     if og and og.get("content"):
-        return urljoin(BASE_URL, clean_text(og.get("content")))
+        content = clean_text(og.get("content"))
+        return content if content.startswith("http") else urljoin(BASE_URL, content)
 
     img = (
         soup.select_one(".woocommerce-product-gallery__image img[src]")
@@ -171,7 +232,8 @@ def extract_image_url(soup: BeautifulSoup) -> str:
         or soup.select_one("img[src]")
     )
     if img and img.get("src"):
-        return urljoin(BASE_URL, clean_text(img.get("src")))
+        src = clean_text(img.get("src"))
+        return src if src.startswith("http") else urljoin(BASE_URL, src)
 
     return ""
 
@@ -203,23 +265,24 @@ def extract_prices_and_em(soup: BeautifulSoup) -> Tuple[str, str, str]:
     sale_price = ""
     em = "kos"
 
-    # akcijska cena
     m_sale = re.search(r"Akcijska cena\s*([0-9.,]+)", page_text, flags=re.IGNORECASE)
     if m_sale:
         sale_price = round_price_2dec(m_sale.group(1))
 
-    # redna cena
-    m_price = re.search(r"Cena\s*:\s*([0-9.,]+)", page_text, flags=re.IGNORECASE)
+    m_price = re.search(r"Cena\s*:?\s*([0-9.,]+)", page_text, flags=re.IGNORECASE)
     if m_price:
         regular_price = round_price_2dec(m_price.group(1))
 
-    # če je na strani samo ena cena v woocommerce blocku
     if not regular_price:
-        amt = soup.select_one(".woocommerce-Price-amount")
-        if amt and amt.get_text(strip=True):
-            regular_price = round_price_2dec(amt.get_text(" ", strip=True))
+        amounts = soup.select(".woocommerce-Price-amount")
+        if amounts:
+            vals = [round_price_2dec(x.get_text(" ", strip=True)) for x in amounts if x.get_text(" ", strip=True)]
+            vals = [v for v in vals if v]
+            if vals:
+                regular_price = vals[0]
+                if len(vals) >= 2:
+                    sale_price = vals[1]
 
-    # EM
     m_em = re.search(r"Cena je (?:na|za)\s+([A-Za-z0-9²³/]+)", page_text, flags=re.IGNORECASE)
     if m_em:
         em = normalize_em(m_em.group(1))
